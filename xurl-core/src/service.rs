@@ -232,6 +232,12 @@ pub fn query_threads(query: &ThreadQuery, roots: &ProviderRoots) -> Result<Threa
 
     candidates.sort_by_key(|candidate| Reverse(candidate.updated_epoch.unwrap_or(0)));
 
+    // Filter by working directory when the `dir` query parameter is set.
+    if let Some(dir_filter) = query.dir.as_deref() {
+        let provider = query.provider;
+        candidates.retain(|candidate| candidate_matches_dir(candidate, dir_filter, provider));
+    }
+
     if query.limit == 0 {
         return Ok(ThreadQueryResult {
             query: query.clone(),
@@ -292,6 +298,31 @@ pub fn query_threads(query: &ThreadQuery, roots: &ProviderRoots) -> Result<Threa
     })
 }
 
+/// Check whether a `QueryCandidate`'s `thread_source` is associated with the
+/// given working directory.
+///
+/// For Claude the project directory is encoded by replacing `/` with `-` in the
+/// path segments (e.g. `/Users/alice/foo` becomes `-Users-alice-foo`), and the
+/// resulting string appears as a directory component under
+/// `~/.claude/projects/`.  For other providers the simplest heuristic is to
+/// check whether the source path contains the directory as a literal substring.
+fn candidate_matches_dir(candidate: &QueryCandidate, dir: &str, provider: ProviderKind) -> bool {
+    let source = &candidate.thread_source;
+    match provider {
+        ProviderKind::Claude => {
+            // Claude encodes dirs as path segments with `-` separators,
+            // e.g. `/Users/alice/foo` → `-Users-alice-foo`.  We check that
+            // the encoded form appears as a complete directory component by
+            // requiring a `/` right before it.
+            let encoded = dir.replace('/', "-");
+            source.contains(&format!("/{encoded}/"))
+                || source.contains(&format!("/{encoded}\\"))
+                || source.ends_with(&format!("/{encoded}"))
+        }
+        _ => source.contains(dir),
+    }
+}
+
 pub fn render_thread_query_head_markdown(result: &ThreadQueryResult) -> String {
     let mut output = String::new();
     output.push_str("---\n");
@@ -305,6 +336,10 @@ pub fn render_thread_query_head_markdown(result: &ThreadQueryResult) -> String {
 
     if let Some(q) = &result.query.q {
         push_yaml_string(&mut output, "q", q);
+    }
+
+    if let Some(dir) = &result.query.dir {
+        push_yaml_string(&mut output, "dir", dir);
     }
 
     output.push_str("threads:\n");
@@ -4938,6 +4973,7 @@ mod tests {
                 provider: ProviderKind::Codex,
                 role: None,
                 q: None,
+                dir: None,
                 limit: 1,
                 ignored_params: Vec::new(),
             },

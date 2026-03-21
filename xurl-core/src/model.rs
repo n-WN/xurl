@@ -186,6 +186,7 @@ pub struct ThreadQuery {
     pub provider: ProviderKind,
     pub role: Option<String>,
     pub q: Option<String>,
+    pub dir: Option<String>,
     pub limit: usize,
     pub ignored_params: Vec<String>,
 }

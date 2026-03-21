@@ -365,11 +365,16 @@ pub fn parse_role_uri(input: &str) -> Result<Option<RoleUri>> {
     }))
 }
 
-fn parse_thread_query_pairs(
-    input: &str,
-    query_raw: &str,
-) -> Result<(Option<String>, usize, Vec<String>)> {
+struct ThreadQueryPairs {
+    q: Option<String>,
+    dir: Option<String>,
+    limit: usize,
+    ignored_params: Vec<String>,
+}
+
+fn parse_thread_query_pairs(input: &str, query_raw: &str) -> Result<ThreadQueryPairs> {
     let mut q = None::<String>;
+    let mut dir = None::<String>;
     let mut limit = None::<usize>;
     let mut ignored_params = Vec::<String>::new();
 
@@ -385,6 +390,12 @@ fn parse_thread_query_pairs(
                     q = Some(trimmed.to_string());
                 }
             }
+            "dir" => {
+                let trimmed = value.trim().trim_end_matches('/');
+                if !trimmed.is_empty() {
+                    dir = Some(trimmed.to_string());
+                }
+            }
             "limit" => {
                 limit = Some(value.parse::<usize>().map_err(|_| {
                     XurlError::InvalidUri(format!("{input} (invalid limit={value})"))
@@ -398,7 +409,12 @@ fn parse_thread_query_pairs(
         }
     }
 
-    Ok((q, limit.unwrap_or(10), ignored_params))
+    Ok(ThreadQueryPairs {
+        q,
+        dir,
+        limit: limit.unwrap_or(10),
+        ignored_params,
+    })
 }
 
 pub fn parse_collection_query_uri(input: &str) -> Result<Option<ThreadQuery>> {
@@ -416,15 +432,16 @@ pub fn parse_collection_query_uri(input: &str) -> Result<Option<ThreadQuery>> {
     }
 
     let provider = parse_provider(provider_part)?;
-    let (q, limit, ignored_params) = parse_thread_query_pairs(input, query_raw)?;
+    let pairs = parse_thread_query_pairs(input, query_raw)?;
 
     Ok(Some(ThreadQuery {
         uri: input.to_string(),
         provider,
         role: None,
-        q,
-        limit,
-        ignored_params,
+        q: pairs.q,
+        dir: pairs.dir,
+        limit: pairs.limit,
+        ignored_params: pairs.ignored_params,
     }))
 }
 
@@ -441,15 +458,16 @@ pub fn parse_role_query_uri(input: &str) -> Result<Option<ThreadQuery>> {
         input
     };
     let (_, query_raw) = target.split_once('?').map_or((target, ""), |parts| parts);
-    let (q, limit, ignored_params) = parse_thread_query_pairs(input, query_raw)?;
+    let pairs = parse_thread_query_pairs(input, query_raw)?;
 
     Ok(Some(ThreadQuery {
         uri: input.to_string(),
         provider: role_uri.provider,
         role: Some(role_uri.role),
-        q,
-        limit,
-        ignored_params,
+        q: pairs.q,
+        dir: pairs.dir,
+        limit: pairs.limit,
+        ignored_params: pairs.ignored_params,
     }))
 }
 
