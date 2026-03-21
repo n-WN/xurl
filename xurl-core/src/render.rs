@@ -108,6 +108,9 @@ fn extract_timeline_entries(
             path, raw_jsonl,
         )?));
     }
+    if provider == ProviderKind::Kimi {
+        return Ok(messages_to_entries(extract_kimi_messages(raw_jsonl)));
+    }
     if provider == ProviderKind::Pi {
         return extract_pi_entries(path, raw_jsonl, session_id, target_entry_id);
     }
@@ -130,6 +133,7 @@ fn extract_timeline_entries(
             ProviderKind::Codex => extract_codex_entry(&value),
             ProviderKind::Claude => extract_claude_entry(&value),
             ProviderKind::Gemini => None,
+            ProviderKind::Kimi => None,
             ProviderKind::Pi => None,
             ProviderKind::Opencode => extract_opencode_message(&value).map(TimelineEntry::Message),
         };
@@ -601,6 +605,70 @@ fn extract_text(content: Option<&Value>) -> String {
     chunks.join("\n\n")
 }
 
+fn extract_kimi_messages(raw_jsonl: &str) -> Vec<ThreadMessage> {
+    let mut messages = Vec::new();
+
+    for line in raw_jsonl.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+
+        let Some(role) = value
+            .get("role")
+            .and_then(Value::as_str)
+            .and_then(parse_role)
+        else {
+            continue;
+        };
+
+        let text = extract_kimi_text(&value);
+        if text.trim().is_empty() {
+            continue;
+        }
+
+        messages.push(ThreadMessage { role, text });
+    }
+
+    messages
+}
+
+fn extract_kimi_text(value: &Value) -> String {
+    if let Some(text) = value.get("content").and_then(Value::as_str) {
+        if !text.trim().is_empty() {
+            return text.to_string();
+        }
+    }
+
+    let Some(items) = value.get("content").and_then(Value::as_array) else {
+        return String::new();
+    };
+
+    let mut chunks = Vec::new();
+    for item in items {
+        let Some(item_type) = item.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+
+        match item_type {
+            "think" | "text" => {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    if !text.trim().is_empty() {
+                        chunks.push(text.trim().to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    chunks.join("\n\n")
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -778,5 +846,29 @@ mod tests {
         assert!(output.contains("Summary: old conversation"));
         assert!(!output.contains("## 1. User"));
         assert!(output.contains("## 2. Assistant"));
+    }
+
+    #[test]
+    fn kimi_extracts_string_content_messages() {
+        let raw = r#"{"role":"user","content":"hello"}
+{"role":"assistant","content":"world"}"#;
+
+        let messages =
+            extract_messages(ProviderKind::Kimi, Path::new("/tmp/mock"), raw).expect("extract");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].text, "hello");
+        assert_eq!(messages[1].text, "world");
+    }
+
+    #[test]
+    fn kimi_extracts_think_and_text_content_types() {
+        let raw = r#"{"role":"user","content":[{"type":"text","text":"hello"}]}
+{"role":"assistant","content":[{"type":"think","text":"reasoning"},{"type":"tool_call","name":"read_file"},{"type":"text","text":"done"}]}"#;
+
+        let messages =
+            extract_messages(ProviderKind::Kimi, Path::new("/tmp/mock"), raw).expect("extract");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].text, "hello");
+        assert_eq!(messages[1].text, "reasoning\n\ndone");
     }
 }

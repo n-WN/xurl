@@ -24,6 +24,7 @@ use crate::provider::amp::AmpProvider;
 use crate::provider::claude::ClaudeProvider;
 use crate::provider::codex::CodexProvider;
 use crate::provider::gemini::GeminiProvider;
+use crate::provider::kimi::KimiProvider;
 use crate::provider::opencode::OpencodeProvider;
 use crate::provider::pi::PiProvider;
 use crate::provider::{Provider, ProviderRoots, WriteEventSink};
@@ -169,6 +170,7 @@ pub fn resolve_thread(uri: &AgentsUri, roots: &ProviderRoots) -> Result<Resolved
         ProviderKind::Codex => CodexProvider::new(&roots.codex_root).resolve(session_id),
         ProviderKind::Claude => ClaudeProvider::new(&roots.claude_root).resolve(session_id),
         ProviderKind::Gemini => GeminiProvider::new(&roots.gemini_root).resolve(session_id),
+        ProviderKind::Kimi => KimiProvider::new(&roots.kimi_root).resolve(session_id),
         ProviderKind::Pi => PiProvider::new(&roots.pi_root).resolve(session_id),
         ProviderKind::Opencode => OpencodeProvider::new(&roots.opencode_root).resolve(session_id),
     }
@@ -185,6 +187,7 @@ pub fn write_thread(
         ProviderKind::Codex => CodexProvider::new(&roots.codex_root).write(req, sink),
         ProviderKind::Claude => ClaudeProvider::new(&roots.claude_root).write(req, sink),
         ProviderKind::Gemini => GeminiProvider::new(&roots.gemini_root).write(req, sink),
+        ProviderKind::Kimi => Err(XurlError::UnsupportedProviderWrite("kimi".to_string())),
         ProviderKind::Pi => PiProvider::new(&roots.pi_root).write(req, sink),
         ProviderKind::Opencode => OpencodeProvider::new(&roots.opencode_root).write(req, sink),
     }
@@ -218,6 +221,7 @@ pub fn query_threads(query: &ThreadQuery, roots: &ProviderRoots) -> Result<Threa
         ProviderKind::Codex => collect_codex_query_candidates(roots, &mut warnings),
         ProviderKind::Claude => collect_claude_query_candidates(roots, &mut warnings),
         ProviderKind::Gemini => collect_gemini_query_candidates(roots, &mut warnings),
+        ProviderKind::Kimi => collect_kimi_query_candidates(roots, &mut warnings),
         ProviderKind::Pi => collect_pi_query_candidates(roots, &mut warnings),
         ProviderKind::Opencode => collect_opencode_query_candidates(
             roots,
@@ -488,6 +492,16 @@ pub fn render_thread_head_markdown(uri: &AgentsUri, roots: &ProviderRoots) -> Re
 
             render_warnings(&mut output, &warnings);
         }
+        (ProviderKind::Kimi, None) => {
+            let resolved = resolve_thread(uri, roots)?;
+            push_yaml_string(
+                &mut output,
+                "thread_source",
+                &resolved.path.display().to_string(),
+            );
+            push_yaml_string(&mut output, "mode", "thread");
+            render_warnings(&mut output, &resolved.metadata.warnings);
+        }
         (ProviderKind::Pi, None) => {
             let resolved = resolve_thread(uri, roots)?;
             push_yaml_string(
@@ -518,6 +532,7 @@ pub fn render_thread_head_markdown(uri: &AgentsUri, roots: &ProviderRoots) -> Re
             | ProviderKind::Codex
             | ProviderKind::Claude
             | ProviderKind::Gemini
+            | ProviderKind::Kimi
             | ProviderKind::Opencode,
             Some(_),
         ) => {
@@ -654,6 +669,16 @@ pub fn resolve_subagent_view(
         ProviderKind::Codex => resolve_codex_subagent_view(uri, roots, list),
         ProviderKind::Claude => resolve_claude_subagent_view(uri, roots, list),
         ProviderKind::Gemini => resolve_gemini_subagent_view(uri, roots, list),
+        ProviderKind::Kimi => Ok(SubagentView::List(SubagentListView {
+            query: SubagentQuery {
+                provider: "kimi".to_string(),
+                main_thread_id: uri.session_id.clone(),
+                agent_id: uri.agent_id.clone(),
+                list,
+            },
+            agents: Vec::new(),
+            warnings: Vec::new(),
+        })),
         ProviderKind::Pi => resolve_pi_subagent_view(uri, roots, list),
         ProviderKind::Opencode => resolve_opencode_subagent_view(uri, roots, list),
     }
@@ -719,6 +744,7 @@ fn collect_thread_metadata(provider: ProviderKind, path: &Path) -> (Vec<String>,
         ProviderKind::Codex => collect_codex_thread_metadata(path, &raw),
         ProviderKind::Claude => collect_claude_thread_metadata(path, &raw),
         ProviderKind::Gemini => collect_gemini_thread_metadata(path, &raw),
+        ProviderKind::Kimi => (Vec::new(), Vec::new()),
         ProviderKind::Pi => collect_pi_thread_metadata(path, &raw),
         ProviderKind::Opencode => collect_opencode_thread_metadata(path, &raw),
     }
@@ -757,7 +783,7 @@ fn collect_query_thread_metadata(provider: ProviderKind, path: &Path) -> Option<
                 _ => false,
             }
         }),
-        ProviderKind::Amp | ProviderKind::Gemini | ProviderKind::Opencode => {
+        ProviderKind::Amp | ProviderKind::Gemini | ProviderKind::Kimi | ProviderKind::Opencode => {
             collect_thread_metadata(provider, path).0
         }
     };
@@ -4321,6 +4347,44 @@ fn collect_gemini_query_candidates(
             session_id.clone(),
             format!("agents://gemini/{session_id}"),
             path,
+        ));
+    }
+
+    candidates
+}
+
+fn collect_kimi_query_candidates(
+    roots: &ProviderRoots,
+    _warnings: &mut Vec<String>,
+) -> Vec<QueryCandidate> {
+    let sessions_root = roots.kimi_root.join("sessions");
+    if !sessions_root.exists() {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    for entry in WalkDir::new(&sessions_root)
+        .min_depth(2)
+        .max_depth(2)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
+        if !entry.file_type().is_dir() {
+            continue;
+        }
+        let dir_name = entry.file_name().to_string_lossy().to_string();
+        if !is_uuid_session_id(&dir_name) {
+            continue;
+        }
+        let context_path = entry.path().join("context.jsonl");
+        if !context_path.exists() {
+            continue;
+        }
+        let session_id = dir_name.to_ascii_lowercase();
+        candidates.push(make_file_candidate(
+            session_id.clone(),
+            format!("agents://kimi/{session_id}"),
+            context_path,
         ));
     }
 

@@ -9,6 +9,7 @@ pub enum ProviderKind {
     Codex,
     Claude,
     Gemini,
+    Kimi,
     Pi,
     Opencode,
 }
@@ -20,6 +21,7 @@ impl fmt::Display for ProviderKind {
             Self::Codex => write!(f, "codex"),
             Self::Claude => write!(f, "claude"),
             Self::Gemini => write!(f, "gemini"),
+            Self::Kimi => write!(f, "kimi"),
             Self::Pi => write!(f, "pi"),
             Self::Opencode => write!(f, "opencode"),
         }
