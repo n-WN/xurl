@@ -36,6 +36,7 @@ const STATUS_COMPLETED: &str = "completed";
 const STATUS_ERRORED: &str = "errored";
 const STATUS_SHUTDOWN: &str = "shutdown";
 const STATUS_NOT_FOUND: &str = "notFound";
+const QUERY_METADATA_LINE_BUDGET: usize = 64;
 
 #[derive(Debug, Default, Clone)]
 struct AgentTimeline {
@@ -275,6 +276,12 @@ pub fn query_threads(query: &ThreadQuery, roots: &ProviderRoots) -> Result<Threa
             thread_source: candidate.thread_source.clone(),
             updated_at: candidate.updated_at.clone(),
             matched_preview,
+            thread_metadata: match &candidate.search_target {
+                QuerySearchTarget::File(path) => {
+                    collect_query_thread_metadata(query.provider, path)
+                }
+                QuerySearchTarget::Text(_) => None,
+            },
         });
     }
 
@@ -313,6 +320,9 @@ pub fn render_thread_query_head_markdown(result: &ThreadQueryResult) -> String {
             }
             if let Some(matched_preview) = &item.matched_preview {
                 push_yaml_string_with_indent(&mut output, 2, "matched_preview", matched_preview);
+            }
+            if let Some(thread_metadata) = &item.thread_metadata {
+                render_thread_metadata_with_indent(&mut output, 2, thread_metadata);
             }
         }
     }
@@ -675,10 +685,18 @@ fn render_thread_metadata(output: &mut String, metadata: &[String]) {
     if metadata.is_empty() {
         return;
     }
+    render_thread_metadata_with_indent(output, 0, metadata);
+}
 
-    output.push_str("thread_metadata:\n");
+fn render_thread_metadata_with_indent(output: &mut String, indent: usize, metadata: &[String]) {
+    if metadata.is_empty() {
+        return;
+    }
+
+    let prefix = " ".repeat(indent);
+    output.push_str(&format!("{prefix}thread_metadata:\n"));
     for value in metadata {
-        output.push_str(&format!("  - '{}'\n", yaml_single_quoted(value)));
+        output.push_str(&format!("{prefix}  - '{}'\n", yaml_single_quoted(value)));
     }
 }
 
@@ -704,6 +722,85 @@ fn collect_thread_metadata(provider: ProviderKind, path: &Path) -> (Vec<String>,
         ProviderKind::Pi => collect_pi_thread_metadata(path, &raw),
         ProviderKind::Opencode => collect_opencode_thread_metadata(path, &raw),
     }
+}
+
+fn collect_query_thread_metadata(provider: ProviderKind, path: &Path) -> Option<Vec<String>> {
+    let metadata = match provider {
+        ProviderKind::Codex => {
+            collect_query_jsonl_thread_metadata(path, |value, metadata, seen| {
+                match value.get("type").and_then(Value::as_str) {
+                    Some("session_meta") | Some("turn_context") => {
+                        push_thread_metadata_record(metadata, seen, &value)
+                    }
+                    _ => false,
+                }
+            })
+        }
+        ProviderKind::Claude => {
+            collect_query_jsonl_thread_metadata(path, |value, metadata, seen| {
+                if looks_like_claude_metadata(&value) {
+                    let mut metadata_value = value;
+                    if let Some(object) = metadata_value.as_object_mut() {
+                        object.remove("message");
+                    }
+                    push_thread_metadata_record(metadata, seen, &metadata_value)
+                } else {
+                    false
+                }
+            })
+        }
+        ProviderKind::Pi => collect_query_jsonl_thread_metadata(path, |value, metadata, seen| {
+            match value.get("type").and_then(Value::as_str) {
+                Some("session") | Some("model_change") | Some("thinking_level_change") => {
+                    push_thread_metadata_record(metadata, seen, &value)
+                }
+                _ => false,
+            }
+        }),
+        ProviderKind::Amp | ProviderKind::Gemini | ProviderKind::Opencode => {
+            collect_thread_metadata(provider, path).0
+        }
+    };
+
+    if metadata.is_empty() {
+        None
+    } else {
+        Some(metadata)
+    }
+}
+
+fn collect_query_jsonl_thread_metadata<F>(path: &Path, mut on_value: F) -> Vec<String>
+where
+    F: FnMut(Value, &mut Vec<String>, &mut BTreeSet<String>) -> bool,
+{
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return Vec::new(),
+    };
+
+    let reader = BufReader::new(file);
+    let mut metadata = Vec::new();
+    let mut seen = BTreeSet::<String>::new();
+
+    for line in reader.lines().take(QUERY_METADATA_LINE_BUDGET) {
+        let Ok(line) = line else {
+            break;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+
+        if on_value(value, &mut metadata, &mut seen) {
+            break;
+        }
+    }
+
+    metadata
 }
 
 fn collect_codex_thread_metadata(path: &Path, raw: &str) -> (Vec<String>, Vec<String>) {
@@ -4740,6 +4837,10 @@ mod tests {
         collect_claude_thread_metadata, collect_codex_thread_metadata, collect_pi_thread_metadata,
         extract_last_timestamp, read_thread_raw,
     };
+    use crate::{
+        ProviderKind, ThreadQuery, ThreadQueryItem, ThreadQueryResult,
+        render_thread_query_head_markdown,
+    };
 
     #[test]
     fn empty_file_returns_error() {
@@ -4827,5 +4928,35 @@ mod tests {
                 .iter()
                 .any(|item| item.contains("thinking_level_change"))
         );
+    }
+
+    #[test]
+    fn render_thread_query_head_renders_metadata_entries() {
+        let result = ThreadQueryResult {
+            query: ThreadQuery {
+                uri: "agents://codex?limit=1".to_string(),
+                provider: ProviderKind::Codex,
+                role: None,
+                q: None,
+                limit: 1,
+                ignored_params: Vec::new(),
+            },
+            items: vec![ThreadQueryItem {
+                thread_id: "019c871c-b1f9-7f60-9c4f-87ed09f13592".to_string(),
+                uri: "agents://codex/019c871c-b1f9-7f60-9c4f-87ed09f13592".to_string(),
+                thread_source: "/tmp/mock.jsonl".to_string(),
+                updated_at: Some("123".to_string()),
+                matched_preview: None,
+                thread_metadata: Some(vec![
+                    "type = session_meta".to_string(),
+                    "payload.cwd = /tmp/project".to_string(),
+                ]),
+            }],
+            warnings: Vec::new(),
+        };
+
+        let output = render_thread_query_head_markdown(&result);
+        assert!(output.contains("thread_metadata:"));
+        assert!(output.contains("payload.cwd = /tmp/project"));
     }
 }
