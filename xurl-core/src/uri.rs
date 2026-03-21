@@ -23,6 +23,48 @@ pub fn is_uuid_session_id(input: &str) -> bool {
     SESSION_ID_RE.is_match(input)
 }
 
+/// Returns `true` when `id` is a complete session identifier for the given
+/// provider (full UUID, full Amp T-prefixed UUID, full Opencode `ses_` id).
+pub fn is_full_session_id(provider: ProviderKind, id: &str) -> bool {
+    looks_like_session_id(provider, id)
+}
+
+/// Returns `true` when `id` *could* be a partial (prefix / substring) session
+/// identifier for the given provider.  This is intentionally broader than
+/// `is_full_session_id` so that we accept inputs like `720a-4c31` as valid
+/// partial session IDs while still rejecting strings that are clearly role
+/// names such as `reviewer` or `developer`.
+fn could_be_partial_session_id(provider: ProviderKind, id: &str) -> bool {
+    if id.is_empty() {
+        return false;
+    }
+    match provider {
+        ProviderKind::Amp => {
+            // Full id: t-<uuid>.  Partial: must start with "t-" and rest is hex/dashes,
+            // or a bare hex-dash substring containing at least one digit.
+            if let Some(rest) = id.strip_prefix("t-").or_else(|| id.strip_prefix("T-")) {
+                !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+            } else {
+                id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+                    && id.bytes().any(|b| b.is_ascii_digit())
+            }
+        }
+        ProviderKind::Opencode => {
+            // Full id: ses_<alphanum>+.  Partial: starts with "ses_" or
+            // is a pure alphanumeric substring that could match inside an id.
+            id.starts_with("ses_")
+                || (id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                    && id.bytes().any(|b| b.is_ascii_digit()))
+        }
+        // UUID-based providers: hex characters and dashes, must contain at
+        // least one digit to distinguish from role names like "reviewer".
+        _ => {
+            id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+                && id.bytes().any(|b| b.is_ascii_digit())
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentsUri {
     pub provider: ProviderKind,
@@ -176,22 +218,11 @@ impl FromStr for AgentsUri {
             });
         }
 
-        match provider {
-            ProviderKind::Amp if !AMP_SESSION_ID_RE.is_match(raw_id) => {
-                return Err(XurlError::InvalidSessionId(raw_id.to_string()));
-            }
-            ProviderKind::Codex
-            | ProviderKind::Claude
-            | ProviderKind::Gemini
-            | ProviderKind::Pi
-                if !is_uuid_session_id(raw_id) =>
-            {
-                return Err(XurlError::InvalidSessionId(raw_id.to_string()));
-            }
-            ProviderKind::Opencode if !OPENCODE_SESSION_ID_RE.is_match(raw_id) => {
-                return Err(XurlError::InvalidSessionId(raw_id.to_string()));
-            }
-            _ => {}
+        // Accept full session IDs as before; also accept partial (substring)
+        // session IDs so that callers can resolve them via fuzzy lookup.
+        let is_full = looks_like_session_id(provider, raw_id);
+        if !is_full && !could_be_partial_session_id(provider, raw_id) {
+            return Err(XurlError::InvalidSessionId(raw_id.to_string()));
         }
 
         if provider == ProviderKind::Amp
@@ -201,13 +232,22 @@ impl FromStr for AgentsUri {
             return Err(XurlError::InvalidSessionId(agent_id.to_string()));
         }
 
-        let session_id = match provider {
-            ProviderKind::Amp => format!("T-{}", raw_id[2..].to_ascii_lowercase()),
-            ProviderKind::Codex
-            | ProviderKind::Claude
-            | ProviderKind::Gemini
-            | ProviderKind::Pi => raw_id.to_ascii_lowercase(),
-            ProviderKind::Opencode => raw_id.to_string(),
+        let session_id = if is_full {
+            match provider {
+                ProviderKind::Amp => format!("T-{}", raw_id[2..].to_ascii_lowercase()),
+                ProviderKind::Codex
+                | ProviderKind::Claude
+                | ProviderKind::Gemini
+                | ProviderKind::Pi => raw_id.to_ascii_lowercase(),
+                ProviderKind::Opencode => raw_id.to_string(),
+            }
+        } else {
+            // Partial session IDs are stored lowercased for case-insensitive
+            // matching (except Opencode which is case-sensitive).
+            match provider {
+                ProviderKind::Opencode => raw_id.to_string(),
+                _ => raw_id.to_ascii_lowercase(),
+            }
         };
 
         let agent_id = raw_agent_id.map(|agent_id| {
@@ -354,7 +394,11 @@ pub fn parse_role_uri(input: &str) -> Result<Option<RoleUri>> {
         None => parse_agents_target(target, input)?,
     };
 
-    if raw_id.is_empty() || raw_agent_id.is_some() || looks_like_session_id(provider, raw_id) {
+    if raw_id.is_empty()
+        || raw_agent_id.is_some()
+        || looks_like_session_id(provider, raw_id)
+        || could_be_partial_session_id(provider, raw_id)
+    {
         return Ok(None);
     }
 

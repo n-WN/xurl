@@ -15,10 +15,10 @@ use walkdir::WalkDir;
 use crate::error::{Result, XurlError};
 use crate::jsonl;
 use crate::model::{
-    MessageRole, PiEntryListItem, PiEntryListView, PiEntryQuery, ProviderKind, ResolvedThread,
-    SubagentDetailView, SubagentExcerptMessage, SubagentLifecycleEvent, SubagentListItem,
-    SubagentListView, SubagentQuery, SubagentRelation, SubagentThreadRef, SubagentView,
-    ThreadQuery, ThreadQueryItem, ThreadQueryResult, WriteRequest, WriteResult,
+    MessageRole, PiEntryListItem, PiEntryListView, PiEntryQuery, ProviderKind, ResolutionMeta,
+    ResolvedThread, SubagentDetailView, SubagentExcerptMessage, SubagentLifecycleEvent,
+    SubagentListItem, SubagentListView, SubagentQuery, SubagentRelation, SubagentThreadRef,
+    SubagentView, ThreadQuery, ThreadQueryItem, ThreadQueryResult, WriteRequest, WriteResult,
 };
 use crate::provider::amp::AmpProvider;
 use crate::provider::claude::ClaudeProvider;
@@ -28,7 +28,7 @@ use crate::provider::opencode::OpencodeProvider;
 use crate::provider::pi::PiProvider;
 use crate::provider::{Provider, ProviderRoots, WriteEventSink};
 use crate::render;
-use crate::uri::{AgentsUri, is_uuid_session_id};
+use crate::uri::{AgentsUri, is_full_session_id, is_uuid_session_id};
 
 const STATUS_PENDING_INIT: &str = "pendingInit";
 const STATUS_RUNNING: &str = "running";
@@ -164,14 +164,97 @@ impl Default for PiDiscoveredChild {
 
 pub fn resolve_thread(uri: &AgentsUri, roots: &ProviderRoots) -> Result<ResolvedThread> {
     let session_id = uri.require_session_id()?;
-    match uri.provider {
-        ProviderKind::Amp => AmpProvider::new(&roots.amp_root).resolve(session_id),
-        ProviderKind::Codex => CodexProvider::new(&roots.codex_root).resolve(session_id),
-        ProviderKind::Claude => ClaudeProvider::new(&roots.claude_root).resolve(session_id),
-        ProviderKind::Gemini => GeminiProvider::new(&roots.gemini_root).resolve(session_id),
-        ProviderKind::Pi => PiProvider::new(&roots.pi_root).resolve(session_id),
-        ProviderKind::Opencode => OpencodeProvider::new(&roots.opencode_root).resolve(session_id),
+
+    if is_full_session_id(uri.provider, session_id) {
+        match uri.provider {
+            ProviderKind::Amp => AmpProvider::new(&roots.amp_root).resolve(session_id),
+            ProviderKind::Codex => CodexProvider::new(&roots.codex_root).resolve(session_id),
+            ProviderKind::Claude => ClaudeProvider::new(&roots.claude_root).resolve(session_id),
+            ProviderKind::Gemini => GeminiProvider::new(&roots.gemini_root).resolve(session_id),
+            ProviderKind::Pi => PiProvider::new(&roots.pi_root).resolve(session_id),
+            ProviderKind::Opencode => {
+                OpencodeProvider::new(&roots.opencode_root).resolve(session_id)
+            }
+        }
+    } else {
+        resolve_thread_partial(uri.provider, roots, session_id)
     }
+}
+
+fn resolve_thread_partial(
+    provider: ProviderKind,
+    roots: &ProviderRoots,
+    partial_id: &str,
+) -> Result<ResolvedThread> {
+    let mut warnings = Vec::new();
+    let candidates = match provider {
+        ProviderKind::Amp => collect_amp_query_candidates(roots, &mut warnings),
+        ProviderKind::Codex => collect_codex_query_candidates(roots, &mut warnings),
+        ProviderKind::Claude => collect_claude_query_candidates(roots, &mut warnings),
+        ProviderKind::Gemini => collect_gemini_query_candidates(roots, &mut warnings),
+        ProviderKind::Pi => collect_pi_query_candidates(roots, &mut warnings),
+        ProviderKind::Opencode => collect_opencode_query_candidates(roots, &mut warnings, false)?,
+    };
+
+    let partial_lower = partial_id.to_ascii_lowercase();
+    let mut matches: Vec<_> = candidates
+        .into_iter()
+        .filter(|c| c.thread_id.to_ascii_lowercase().contains(&partial_lower))
+        .collect();
+
+    if matches.is_empty() {
+        return Err(XurlError::ThreadNotFound {
+            provider: provider.to_string(),
+            session_id: partial_id.to_string(),
+            searched_roots: vec![],
+        });
+    }
+
+    // Sort by most recently updated so the latest match is selected.
+    matches.sort_by_key(|c| Reverse(c.updated_epoch.unwrap_or(0)));
+
+    let best = &matches[0];
+    let mut meta_warnings = Vec::new();
+    if matches.len() > 1 {
+        meta_warnings.push(format!(
+            "partial id '{}' matched {} sessions; selected most recent: {} (id: {})",
+            partial_id,
+            matches.len(),
+            best.thread_source,
+            best.thread_id,
+        ));
+    }
+
+    let path = match &best.search_target {
+        QuerySearchTarget::File(p) => p.clone(),
+        QuerySearchTarget::Text(_) => {
+            // For providers like Opencode whose candidates are backed by a
+            // database rather than individual files, fall back to resolving
+            // the full session id through the normal provider path now that
+            // we have identified the matching id.
+            return match provider {
+                ProviderKind::Opencode => {
+                    OpencodeProvider::new(&roots.opencode_root).resolve(&best.thread_id)
+                }
+                _ => Err(XurlError::ThreadNotFound {
+                    provider: provider.to_string(),
+                    session_id: partial_id.to_string(),
+                    searched_roots: vec![],
+                }),
+            };
+        }
+    };
+
+    Ok(ResolvedThread {
+        provider,
+        session_id: best.thread_id.clone(),
+        path,
+        metadata: ResolutionMeta {
+            source: format!("{provider}:partial-match"),
+            candidate_count: matches.len(),
+            warnings: meta_warnings,
+        },
+    })
 }
 
 pub fn write_thread(
