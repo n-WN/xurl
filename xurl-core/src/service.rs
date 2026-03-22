@@ -1439,6 +1439,7 @@ fn all_provider_kinds() -> Vec<ProviderKind> {
         ProviderKind::Codex,
         ProviderKind::Claude,
         ProviderKind::Gemini,
+        ProviderKind::Kimi,
         ProviderKind::Pi,
         ProviderKind::Opencode,
     ]
@@ -1459,6 +1460,7 @@ fn collect_candidates_for_provider(
         ProviderKind::Codex => Ok(collect_codex_query_candidates(roots, warnings)),
         ProviderKind::Claude => Ok(collect_claude_query_candidates(roots, warnings)),
         ProviderKind::Gemini => Ok(collect_gemini_query_candidates(roots, warnings)),
+        ProviderKind::Kimi => Ok(collect_kimi_query_candidates(roots, warnings)),
         ProviderKind::Pi => Ok(collect_pi_query_candidates(roots, warnings)),
         ProviderKind::Opencode => {
             collect_opencode_query_candidates(roots, warnings, with_search_text)
@@ -4756,9 +4758,11 @@ fn collect_kimi_query_candidates(
         }
         let session_id = dir_name.to_ascii_lowercase();
         candidates.push(make_file_candidate(
+            ProviderKind::Kimi,
             session_id.clone(),
             format!("agents://kimi/{session_id}"),
             context_path,
+            None,
         ));
     }
 
