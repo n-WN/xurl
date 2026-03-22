@@ -10,6 +10,7 @@ pub mod amp;
 pub mod claude;
 pub mod codex;
 pub mod gemini;
+pub mod kimi;
 pub mod opencode;
 pub mod pi;
 
@@ -58,6 +59,7 @@ pub struct ProviderRoots {
     pub codex_root: PathBuf,
     pub claude_root: PathBuf,
     pub gemini_root: PathBuf,
+    pub kimi_root: PathBuf,
     pub pi_root: PathBuf,
     pub opencode_root: PathBuf,
 }
@@ -98,6 +100,14 @@ impl ProviderRoots {
             .unwrap_or_else(|| home.join(".gemini"));
 
         // Precedence:
+        // 1) KIMI_SHARE_DIR (official Kimi share dir env)
+        // 2) ~/.kimi (Kimi default)
+        let kimi_root = env::var_os("KIMI_SHARE_DIR")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".kimi"));
+
+        // Precedence:
         // 1) PI_CODING_AGENT_DIR (official pi coding agent root env)
         // 2) ~/.pi/agent (pi default)
         let pi_root = env::var_os("PI_CODING_AGENT_DIR")
@@ -119,6 +129,7 @@ impl ProviderRoots {
             codex_root,
             claude_root,
             gemini_root,
+            kimi_root,
             pi_root,
             opencode_root,
         })
